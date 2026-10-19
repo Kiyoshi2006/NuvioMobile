@@ -1,0 +1,110 @@
+name: Build patched IPA (hide native tab bar)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      GRADLE_OPTS: -Dfile.encoding=UTF-8
+      IOS_CONFIGURATION: Release
+      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
+      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Patch ContentView.swift
+        run: |
+          cat > /tmp/patch.py <<'EOF'
+          import pathlib
+          p = pathlib.Path("iosApp/iosApp/ContentView.swift")
+          s = p.read_text()
+
+          old = """            onTabBarControllerAvailable: { tabBarController in
+                          appCoordinator.profileTabInteraction.attach(to: tabBarController)
+                      }"""
+          new = """            onTabBarControllerAvailable: { tabBarController in
+                          appCoordinator.profileTabInteraction.attach(to: tabBarController)
+                          if !usesNativeTabBar {
+                              nuvioLegacyTabBarHider.attach(tabBarController.tabBar)
+                          }
+                      }"""
+          assert s.count(old) == 1, "callback not found"
+          s = s.replace(old, new)
+
+          old2 = """    override func viewWillAppear(_ animated: Bool) {
+                  super.viewWillAppear(animated)
+                  configureBackGestures(isVisible: true)
+              }"""
+          new2 = """    override func viewWillAppear(_ animated: Bool) {
+                  super.viewWillAppear(animated)
+                  configureBackGestures(isVisible: true)
+                  if let tabBarController {
+                      onTabBarControllerAvailable?(tabBarController)
+                  }
+              }"""
+          assert s.count(old2) == 1, "viewWillAppear not found"
+          s = s.replace(old2, new2)
+
+          s += """
+
+          // Before iOS 26 the Compose UI draws its own tab bar, so the system UITabBar
+          // must never be shown. Re-hide it whenever SwiftUI turns it back on.
+          let nuvioLegacyTabBarHider = NuvioLegacyTabBarHider()
+
+          final class NuvioLegacyTabBarHider {
+              private weak var tabBar: UITabBar?
+              private var observation: NSKeyValueObservation?
+
+              func attach(_ bar: UITabBar) {
+                  bar.isHidden = true
+                  guard tabBar !== bar else { return }
+                  tabBar = bar
+                  observation = bar.observe(\\.isHidden, options: [.new]) { observed, change in
+                      if change.newValue == false {
+                          DispatchQueue.main.async { observed.isHidden = true }
+                      }
+                  }
+              }
+          }
+          """
+          p.write_text(s)
+          print("patched OK")
+          EOF
+          python3 /tmp/patch.py
+          git --no-pager diff --stat
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: |
+            konan-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Prepare iOS dependencies
+        run: ./scripts/prepare-ios-dependencies.sh
+
+      - name: Build unsigned IPA
+        run: ./scripts/build-ios-ipa.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Nuvio-patched-ipa
+          path: build/ios-ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 7
